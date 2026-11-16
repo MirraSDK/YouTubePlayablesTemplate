@@ -72,7 +72,7 @@ const unityApp = {
         }
     },
 
-    // Downloads the zipped build files with combined progress and unzips each one into a blob URL as soon as it arrives.
+    // Downloads the zipped build files with combined progress and unzips each one into a blob as soon as it arrives.
     downloadArchives: function (archives, onProgress) {
         const loaded = archives.map(() => 0);
         const sizes = archives.map(() => 0);
@@ -95,7 +95,7 @@ const unityApp = {
         for (let attempt = 1; ; attempt++) {
             try {
                 const bytes = await this.fetchWithProgress(archive.url, onProgress, attempt > 1);
-                return await this.unzipToBlobUrl(bytes, archive.name, archive.type);
+                return await this.unzipToBlob(bytes, archive.name, archive.type);
             }
             catch (error) {
                 if (attempt >= attempts) throw error;
@@ -140,12 +140,12 @@ const unityApp = {
 
     // Inflates with the browser's native DecompressionStream, or with the bundled decoder where "deflate-raw" is missing.
     // Nothing is fetched from other domains: YouTube Playables forbids it.
-    unzipToBlobUrl: async function (bytes, fileName, mimeType) {
+    unzipToBlob: async function (bytes, fileName, mimeType) {
         const entry = this.findZipEntry(bytes, fileName);
         const data = bytes.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
         if (data.length !== entry.compressedSize) throw new Error("Truncated zip archive: " + fileName);
 
-        if (entry.method === 0) return URL.createObjectURL(new Blob([data], { type: mimeType }));
+        if (entry.method === 0) return new Blob([data], { type: mimeType });
         if (entry.method !== 8) throw new Error(`Unsupported zip compression method ${entry.method}: ${fileName}`);
 
         // The engine must never get a partly inflated file, so the size is checked and the bundled decoder takes over
@@ -169,7 +169,37 @@ const unityApp = {
             blob = new Blob([inflated]);
         }
 
-        return URL.createObjectURL(blob.slice(0, blob.size, mimeType));
+        return blob.slice(0, blob.size, mimeType);
+    },
+
+    // Blob URLs work with every version of the Unity loader. Where the page policy refuses to fetch them, the same
+    // files are answered from memory under their build paths instead.
+    publishBuildFiles: async function (files) {
+        if (await this.canFetchBlobUrls()) return files.map((file) => URL.createObjectURL(file.blob));
+
+        const blobs = new Map(files.map((file) => [file.url, file.blob]));
+        const nativeFetch = window.fetch;
+        window.fetch = function (resource) {
+            const blob = typeof resource === "string" ? blobs.get(resource) : undefined;
+            if (!blob) return nativeFetch.apply(window, arguments);
+            return Promise.resolve(new Response(blob, {
+                headers: { "Content-Type": blob.type, "Content-Length": String(blob.size) },
+            }));
+        };
+        return files.map((file) => file.url);
+    },
+
+    canFetchBlobUrls: async function () {
+        const url = URL.createObjectURL(new Blob(["blob"]));
+        try {
+            return (await fetch(url)).ok;
+        }
+        catch (error) {
+            return false;
+        }
+        finally {
+            URL.revokeObjectURL(url);
+        }
     },
 
     // Chrome 80 to 102 has DecompressionStream but throws on the "deflate-raw" format.
@@ -454,22 +484,29 @@ const unityApp = {
         this.notifyFirstFrameReady();
 
         const buildUrl = "Build";
+        const dataPath = buildUrl + "/{{{ DATA_FILENAME }}}";
+        const codePath = buildUrl + "/{{{ CODE_FILENAME }}}";
 
-        const [dataBlobUrl, codeBlobUrl] = await this.downloadArchives([
-            { url: buildUrl + "/{{{ DATA_FILENAME }}}.zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
-            { url: buildUrl + "/{{{ CODE_FILENAME }}}.zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
+        const [dataBlob, codeBlob] = await this.downloadArchives([
+            { url: dataPath + ".zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
+            { url: codePath + ".zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
         ], (progress) => pageLoader.setStage("download", progress));
+
+        const [dataUrl, codeUrl] = await this.publishBuildFiles([
+            { url: dataPath, blob: dataBlob },
+            { url: codePath, blob: codeBlob },
+        ]);
 
         const loaderUrl = buildUrl + "/{{{ LOADER_FILENAME }}}";
         const config = {
             arguments: [],
-            dataUrl: dataBlobUrl,
+            dataUrl: dataUrl,
             frameworkUrl: buildUrl + "/{{{ FRAMEWORK_FILENAME }}}",
             #if USE_THREADS
         workerUrl: buildUrl + "/{{{ WORKER_FILENAME }}}",
             #endif
         #if USE_WASM
-        codeUrl: codeBlobUrl,
+        codeUrl: codeUrl,
             #endif
         #if SYMBOLS_FILENAME
         symbolsUrl: buildUrl + "/{{{ SYMBOLS_FILENAME }}}",
