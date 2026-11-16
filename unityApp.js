@@ -240,7 +240,8 @@ const unityApp = {
         }
 
         if (isPortraitLocked && isLandscapeLocked) {
-            throw new Error("Both portrait and landscape lock cannot be enabled at the same time.");
+            console.warn("Both portrait and landscape lock are enabled, so neither is applied.");
+            return;
         }
 
         const root = document.createElement("div");
@@ -556,17 +557,16 @@ const unityApp = {
 
 };
 
-// Give scripts created from code the page nonce.
-unityApp.applyScriptNonce();
-
-// Apply common fixes.
-unityApp.applyCommonFixes();
-
-// Lock rotation.
-unityApp.tryRotationLock();
-
-// Lock aspect ratio.
-unityApp.tryLockAspectRatio();
+// Prepare the page: script nonce, common fixes, rotation lock and aspect ratio lock.
+// A step that fails must never keep the game from loading.
+for (const step of ["applyScriptNonce", "applyCommonFixes", "tryRotationLock", "tryLockAspectRatio"]) {
+    try {
+        unityApp[step]();
+    }
+    catch (error) {
+        console.error(error);
+    }
+}
 
 // Automatically start after script is loaded.
 unityApp.startLoading();
