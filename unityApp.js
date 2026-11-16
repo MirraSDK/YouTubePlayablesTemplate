@@ -18,6 +18,21 @@ const unityApp = {
         document.addEventListener('contextmenu', (event) => event.preventDefault());
     },
 
+    // YouTube's content security policy only runs scripts that carry the page nonce. YouTube adds it to the tags of
+    // index.html; scripts created from code, like the ones the Unity loader adds for the engine, get it here.
+    applyScriptNonce: function () {
+        const nonced = document.querySelector("script[nonce]");
+        const nonce = nonced && (nonced.nonce || nonced.getAttribute("nonce"));
+        if (!nonce) return;
+
+        const nativeCreateElement = document.createElement;
+        document.createElement = function (tagName) {
+            const element = nativeCreateElement.apply(this, arguments);
+            if (typeof tagName === "string" && tagName.toLowerCase() === "script" && !element.nonce) element.nonce = nonce;
+            return element;
+        };
+    },
+
     // The page loader is already on screen, so YouTube may show the game; gameReady follows once the game is playable.
     // The SDK skips its own firstFrameReady call when this flag is set.
     notifyFirstFrameReady: function () {
@@ -540,6 +555,9 @@ const unityApp = {
     },
 
 };
+
+// Give scripts created from code the page nonce.
+unityApp.applyScriptNonce();
 
 // Apply common fixes.
 unityApp.applyCommonFixes();
