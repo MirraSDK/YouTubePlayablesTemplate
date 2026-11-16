@@ -56,6 +56,24 @@ const unityApp = {
         this.logErrorToYouTube();
     },
 
+    // YouTube keeps its own spinner until gameReady and no loading screen may stay up past that call, so the page
+    // loader leaves with it, also when the game never hides the loader itself.
+    hideLoaderOnGameReady: function (pageLoader) {
+        const game = window.ytgame && window.ytgame.game;
+        if (!game || typeof game.gameReady !== "function") return;
+
+        const nativeGameReady = game.gameReady;
+        try {
+            game.gameReady = function () {
+                pageLoader.hide();
+                return nativeGameReady.apply(game, arguments);
+            };
+        }
+        catch (error) {
+            console.warn(error);
+        }
+    },
+
     // The page loader is already on screen, so YouTube may show the game; gameReady follows once the game is playable.
     // The SDK skips its own firstFrameReady call when this flag is set.
     notifyFirstFrameReady: function () {
@@ -482,6 +500,7 @@ const unityApp = {
         window.pageLoader = pageLoader;
         pageLoader.show();
         this.notifyFirstFrameReady();
+        this.hideLoaderOnGameReady(pageLoader);
 
         const buildUrl = "Build";
         const dataPath = buildUrl + "/{{{ DATA_FILENAME }}}";
