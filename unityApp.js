@@ -490,6 +490,13 @@ const unityApp = {
                     }
                 }
             },
+            // Unity reports runtime errors with alert(), which an embedded frame cannot open. They go to the console
+            // and to YouTube instead.
+            errorHandler: (message, filename, lineno) => {
+                console.error(message, filename, lineno);
+                unityApp.logErrorToYouTube();
+                return true;
+            },
             // The build files arrive as blob URLs and must not be cached again on every launch; hashed bundles never
             // change, so they are served from the cache without revalidation; everything else, like the catalog, is fetched fresh.
             cacheControl: (url) => {
