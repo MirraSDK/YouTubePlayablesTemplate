@@ -18,6 +18,62 @@ const unityApp = {
         document.addEventListener('contextmenu', (event) => event.preventDefault());
     },
 
+    // YouTube's content security policy only runs scripts that carry the page nonce. YouTube adds it to the tags of
+    // index.html; scripts created from code, like the ones the Unity loader adds for the engine, get it here.
+    applyScriptNonce: function () {
+        const nonced = document.querySelector("script[nonce]");
+        const nonce = nonced && (nonced.nonce || nonced.getAttribute("nonce"));
+        if (!nonce) return;
+
+        const nativeCreateElement = document.createElement;
+        document.createElement = function (tagName) {
+            const element = nativeCreateElement.apply(this, arguments);
+            if (typeof tagName === "string" && tagName.toLowerCase() === "script" && !element.nonce) element.nonce = nonce;
+            return element;
+        };
+    },
+
+    // Tells YouTube that the game hit an error. The call is best effort and rate limited on its side.
+    logErrorToYouTube: function () {
+        const health = window.ytgame && window.ytgame.health;
+        try {
+            if (health && typeof health.logError === "function") health.logError();
+        }
+        catch (error) {
+            console.error(error);
+        }
+    },
+
+    // A failed load is shown on the page, because an embedded frame cannot open alert(), and is reported to YouTube.
+    reportFailure: function (error) {
+        console.error(error);
+        try {
+            if (window.pageLoader && typeof window.pageLoader.fail === "function") window.pageLoader.fail();
+        }
+        catch (failError) {
+            console.error(failError);
+        }
+        this.logErrorToYouTube();
+    },
+
+    // YouTube keeps its own spinner until gameReady and no loading screen may stay up past that call, so the page
+    // loader leaves with it, also when the game never hides the loader itself.
+    hideLoaderOnGameReady: function (pageLoader) {
+        const game = window.ytgame && window.ytgame.game;
+        if (!game || typeof game.gameReady !== "function") return;
+
+        const nativeGameReady = game.gameReady;
+        try {
+            game.gameReady = function () {
+                pageLoader.hide();
+                return nativeGameReady.apply(game, arguments);
+            };
+        }
+        catch (error) {
+            console.warn(error);
+        }
+    },
+
     // The page loader is already on screen, so YouTube may show the game; gameReady follows once the game is playable.
     // The SDK skips its own firstFrameReady call when this flag is set.
     notifyFirstFrameReady: function () {
@@ -34,8 +90,8 @@ const unityApp = {
         }
     },
 
-    // Downloads the zipped build files with combined progress and unzips each into a blob URL.
-    downloadArchives: async function (archives, onProgress) {
+    // Downloads the zipped build files with combined progress and unzips each one into a blob as soon as it arrives.
+    downloadArchives: function (archives, onProgress) {
         const loaded = archives.map(() => 0);
         const sizes = archives.map(() => 0);
         const report = () => {
@@ -43,19 +99,33 @@ const unityApp = {
             onProgress(total > 0 ? loaded.reduce((sum, size) => sum + size, 0) / total : 0);
         };
 
-        const buffers = await Promise.all(archives.map((archive, index) =>
-            this.fetchWithProgress(archive.url, (done, size) => {
+        return Promise.all(archives.map((archive, index) =>
+            this.downloadArchive(archive, (done, size) => {
                 loaded[index] = done;
                 sizes[index] = size;
                 report();
             })));
-
-        return Promise.all(archives.map((archive, index) =>
-            this.unzipToBlobUrl(buffers[index], archive.name, archive.type)));
     },
 
-    fetchWithProgress: async function (url, onProgress) {
-        const response = await fetch(url);
+    // A dropped connection or a damaged response is tried again before the player is told that the game failed.
+    downloadArchive: async function (archive, onProgress) {
+        const attempts = 3;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const bytes = await this.fetchWithProgress(archive.url, onProgress, attempt > 1);
+                return await this.unzipToBlob(bytes, archive.name, archive.type);
+            }
+            catch (error) {
+                if (attempt >= attempts) throw error;
+                console.warn(`Attempt ${attempt} of ${attempts} failed for ${archive.url}:`, error);
+                await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+            }
+        }
+    },
+
+    // A retry skips the browser cache, which may hold the damaged response.
+    fetchWithProgress: async function (url, onProgress, isRetry) {
+        const response = await fetch(url, isRetry ? { cache: "reload" } : undefined);
         if (!response.ok) throw new Error(`Download failed ${url}: ${response.status} ${response.statusText}`);
 
         const declaredSize = Number(response.headers.get("Content-Length")) || 0;
@@ -88,27 +158,66 @@ const unityApp = {
 
     // Inflates with the browser's native DecompressionStream, or with the bundled decoder where "deflate-raw" is missing.
     // Nothing is fetched from other domains: YouTube Playables forbids it.
-    unzipToBlobUrl: async function (bytes, fileName, mimeType) {
+    unzipToBlob: async function (bytes, fileName, mimeType) {
         const entry = this.findZipEntry(bytes, fileName);
         const data = bytes.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
-        let blob;
+        if (data.length !== entry.compressedSize) throw new Error("Truncated zip archive: " + fileName);
 
-        if (entry.method === 0) {
-            blob = new Blob([data], { type: mimeType });
+        if (entry.method === 0) return new Blob([data], { type: mimeType });
+        if (entry.method !== 8) throw new Error(`Unsupported zip compression method ${entry.method}: ${fileName}`);
+
+        // The engine must never get a partly inflated file, so the size is checked and the bundled decoder takes over
+        // when the native one fails.
+        let blob = null;
+        if (this.supportsRawDeflateStream()) {
+            try {
+                const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+                blob = await new Response(stream).blob();
+                if (blob.size !== entry.uncompressedSize) blob = null;
+            }
+            catch (error) {
+                console.warn(error);
+                blob = null;
+            }
         }
-        else if (entry.method !== 8) {
-            throw new Error(`Unsupported zip compression method ${entry.method}: ${fileName}`);
-        }
-        else if (this.supportsRawDeflateStream()) {
-            const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-            blob = new Blob([await new Response(stream).blob()], { type: mimeType });
-        }
-        else {
+        if (!blob) {
             if (typeof window.rawInflate !== "function") await this.loadScript("TemplateData/rawInflate.js");
-            blob = new Blob([window.rawInflate(data, entry.uncompressedSize)], { type: mimeType });
+            const inflated = window.rawInflate(data, entry.uncompressedSize);
+            if (inflated.length !== entry.uncompressedSize) throw new Error("Damaged zip entry: " + fileName);
+            blob = new Blob([inflated]);
         }
 
-        return URL.createObjectURL(blob);
+        return blob.slice(0, blob.size, mimeType);
+    },
+
+    // Blob URLs work with every version of the Unity loader. Where the page policy refuses to fetch them, the same
+    // files are answered from memory under their build paths instead.
+    publishBuildFiles: async function (files) {
+        if (await this.canFetchBlobUrls()) return files.map((file) => URL.createObjectURL(file.blob));
+
+        const blobs = new Map(files.map((file) => [file.url, file.blob]));
+        const nativeFetch = window.fetch;
+        window.fetch = function (resource) {
+            const blob = typeof resource === "string" ? blobs.get(resource) : undefined;
+            if (!blob) return nativeFetch.apply(window, arguments);
+            return Promise.resolve(new Response(blob, {
+                headers: { "Content-Type": blob.type, "Content-Length": String(blob.size) },
+            }));
+        };
+        return files.map((file) => file.url);
+    },
+
+    canFetchBlobUrls: async function () {
+        const url = URL.createObjectURL(new Blob(["blob"]));
+        try {
+            return (await fetch(url)).ok;
+        }
+        catch (error) {
+            return false;
+        }
+        finally {
+            URL.revokeObjectURL(url);
+        }
     },
 
     // Chrome 80 to 102 has DecompressionStream but throws on the "deflate-raw" format.
@@ -141,12 +250,13 @@ const unityApp = {
         let fallback = null;
 
         for (let index = 0; index < count; index++) {
-            if (view.getUint32(offset, true) !== 0x02014b50) break;
+            if (offset + 46 > bytes.length || view.getUint32(offset, true) !== 0x02014b50) break;
             const nameLength = view.getUint16(offset + 28, true);
             const extraLength = view.getUint16(offset + 30, true);
             const commentLength = view.getUint16(offset + 32, true);
             const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
             const localOffset = view.getUint32(offset + 42, true);
+            if (localOffset + 30 > bytes.length) throw new Error("Truncated zip archive: " + fileName);
             const entry = {
                 method: view.getUint16(offset + 10, true),
                 compressedSize: view.getUint32(offset + 20, true),
@@ -166,7 +276,7 @@ const unityApp = {
         return new Promise((resolve, reject) => {
             const script = document.createElement("script");
             script.src = url;
-            script.onload = resolve;
+            script.onload = () => resolve();
             script.onerror = () => reject(new Error("Failed to load " + url));
             document.head.appendChild(script);
         });
@@ -177,10 +287,12 @@ const unityApp = {
     createPageLoader: function () {
         const element = document.querySelector("#unity-loading-bar");
         const fill = document.querySelector("#unity-progress-bar-full");
+        const failure = document.querySelector("#unity-load-error");
         const weights = { download: 0.6, engine: 0.1, content: 0.3 };
         const progress = { download: 0, engine: 0, content: 0 };
         let shown = 0;
         let isHidden = false;
+        let isFailed = false;
 
         const render = () => {
             const value = weights.download * progress.download + weights.engine * progress.engine + weights.content * progress.content;
@@ -200,8 +312,15 @@ const unityApp = {
             setContentProgress: function (value) {
                 this.setStage("content", value);
             },
+            // Nothing playable is behind a failed load, so the loader stays up with a message in place of the bar.
+            fail: function () {
+                isFailed = true;
+                element.style.display = "flex";
+                fill.parentElement.style.display = "none";
+                if (failure) failure.style.display = "block";
+            },
             hide: function () {
-                if (isHidden) return;
+                if (isHidden || isFailed) return;
                 isHidden = true;
                 element.style.display = "none";
 
@@ -225,7 +344,8 @@ const unityApp = {
         }
 
         if (isPortraitLocked && isLandscapeLocked) {
-            throw new Error("Both portrait and landscape lock cannot be enabled at the same time.");
+            console.warn("Both portrait and landscape lock are enabled, so neither is applied.");
+            return;
         }
 
         const root = document.createElement("div");
@@ -328,6 +448,10 @@ const unityApp = {
         function recalculateAspectRatio(aspectRatio) {
             const containerWidth = container.clientWidth;
             const containerHeight = container.clientHeight;
+
+            // YouTube first loads the game in a view of zero size: the canvas keeps filling it until a real size arrives.
+            if (!(containerWidth > 0 && containerHeight > 0 && aspectRatio > 0)) return;
+
             if (containerWidth / containerHeight > aspectRatio) {
                 canvas.style.width = Math.floor(containerHeight * aspectRatio) + "px";
                 canvas.style.height = "100%";
@@ -376,32 +500,32 @@ const unityApp = {
         window.pageLoader = pageLoader;
         pageLoader.show();
         this.notifyFirstFrameReady();
+        this.hideLoaderOnGameReady(pageLoader);
 
         const buildUrl = "Build";
+        const dataPath = buildUrl + "/{{{ DATA_FILENAME }}}";
+        const codePath = buildUrl + "/{{{ CODE_FILENAME }}}";
 
-        let dataBlobUrl, codeBlobUrl;
-        try {
-            [dataBlobUrl, codeBlobUrl] = await this.downloadArchives([
-                { url: buildUrl + "/{{{ DATA_FILENAME }}}.zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
-                { url: buildUrl + "/{{{ CODE_FILENAME }}}.zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
-            ], (progress) => pageLoader.setStage("download", progress));
-        }
-        catch (error) {
-            console.error(error);
-            alert("The game failed to download. Please check your connection and reload.");
-            return;
-        }
+        const [dataBlob, codeBlob] = await this.downloadArchives([
+            { url: dataPath + ".zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
+            { url: codePath + ".zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
+        ], (progress) => pageLoader.setStage("download", progress));
+
+        const [dataUrl, codeUrl] = await this.publishBuildFiles([
+            { url: dataPath, blob: dataBlob },
+            { url: codePath, blob: codeBlob },
+        ]);
 
         const loaderUrl = buildUrl + "/{{{ LOADER_FILENAME }}}";
         const config = {
             arguments: [],
-            dataUrl: dataBlobUrl,
+            dataUrl: dataUrl,
             frameworkUrl: buildUrl + "/{{{ FRAMEWORK_FILENAME }}}",
             #if USE_THREADS
         workerUrl: buildUrl + "/{{{ WORKER_FILENAME }}}",
             #endif
         #if USE_WASM
-        codeUrl: codeBlobUrl,
+        codeUrl: codeUrl,
             #endif
         #if SYMBOLS_FILENAME
         symbolsUrl: buildUrl + "/{{{ SYMBOLS_FILENAME }}}",
@@ -421,6 +545,13 @@ const unityApp = {
                         break;
                     }
                 }
+            },
+            // Unity reports runtime errors with alert(), which an embedded frame cannot open. They go to the console
+            // and to YouTube instead.
+            errorHandler: (message, filename, lineno) => {
+                console.error(message, filename, lineno);
+                unityApp.logErrorToYouTube();
+                return true;
             },
             // The build files arrive as blob URLs and must not be cached again on every launch; hashed bundles never
             // change, so they are served from the cache without revalidation; everything else, like the catalog, is fetched fresh.
@@ -460,32 +591,28 @@ const unityApp = {
             config.devicePixelRatio = this.toNumber(devicePixelRatio);
         }
 
-        const script = document.createElement("script");
-        script.src = loaderUrl;
-        script.onload = () => {
-            createUnityInstance(canvas, config, (progress) => {
-                pageLoader.setStage("engine", progress);
-            }).then((unityInstance) => {
-                pageLoader.setStage("engine", 1);
-                if (lifecycle) lifecycle.attachUnity(unityInstance);
+        await this.loadScript(loaderUrl);
+        if (typeof createUnityInstance !== "function") {
+            throw new Error("The Unity loader did not define createUnityInstance: " + loaderUrl);
+        }
 
-                // The game hides the loader when its first scene is playable; this only keeps a broken boot from hiding behind it.
-                setTimeout(() => pageLoader.hide(), 180000);
+        const unityInstance = await createUnityInstance(canvas, config, (progress) => {
+            pageLoader.setStage("engine", progress);
+        });
+        pageLoader.setStage("engine", 1);
+        if (lifecycle) lifecycle.attachUnity(unityInstance);
 
-                #if SHOW_DIAGNOSTICS
-                // Position the diagnostics icon in the corner on the canvas.
-                const diagnostics_icon = document.getElementById("diagnostics-icon");
-                diagnostics_icon.onclick = () => {
-                    unityDiagnostics.openDiagnosticsDiv(unityInstance.GetMetricsInfo);
-                };
-                canvas.after(diagnostics_icon);
-                #endif
-            }).catch((message) => {
-                pageLoader.hide();
-                alert(message);
-            });
+        // The game hides the loader when its first scene is playable; this only keeps a broken boot from hiding behind it.
+        setTimeout(() => pageLoader.hide(), 180000);
+
+        #if SHOW_DIAGNOSTICS
+        // Position the diagnostics icon in the corner on the canvas.
+        const diagnostics_icon = document.getElementById("diagnostics-icon");
+        diagnostics_icon.onclick = () => {
+            unityDiagnostics.openDiagnosticsDiv(unityInstance.GetMetricsInfo);
         };
-        document.body.appendChild(script);
+        canvas.after(diagnostics_icon);
+        #endif
     },
 
     isMobile: function () {
@@ -541,14 +668,16 @@ const unityApp = {
 
 };
 
-// Apply common fixes.
-unityApp.applyCommonFixes();
+// Prepare the page: script nonce, common fixes, rotation lock and aspect ratio lock.
+// A step that fails must never keep the game from loading.
+for (const step of ["applyScriptNonce", "applyCommonFixes", "tryRotationLock", "tryLockAspectRatio"]) {
+    try {
+        unityApp[step]();
+    }
+    catch (error) {
+        console.error(error);
+    }
+}
 
-// Lock rotation.
-unityApp.tryRotationLock();
-
-// Lock aspect ratio.
-unityApp.tryLockAspectRatio();
-
-// Automatically start after script is loaded.
-unityApp.startLoading();
+// Automatically start after script is loaded. Every failure on the way ends on the page, not in an unhandled rejection.
+unityApp.startLoading().catch((error) => unityApp.reportFailure(error));

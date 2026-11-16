@@ -79,6 +79,7 @@
         // Hands over the Unity instance, for loaders that were not given preMainLoop in their config.
         attachUnity: function (unityInstance) {
             const unityModule = unityInstance && unityInstance.Module;
+            mainLoop.attach(unityModule);
             if (unityModule && typeof unityModule.preMainLoop !== "function") unityModule.preMainLoop = preMainLoop;
         },
         isPaused: () => isPaused,
@@ -278,7 +279,10 @@
     // yet would break the engine.
     function createMainLoopGate() {
         let unityModule = null;
+        let attachedModule = null;
         let isHolding = false;
+
+        const canPause = (module) => !!module && typeof module.pauseMainLoop === "function";
 
         const call = (name) => {
             try {
@@ -292,8 +296,13 @@
         };
 
         return {
+            // The module the loader handed over, for engine versions that call preMainLoop without the module as "this".
+            attach: (module) => {
+                if (canPause(module)) attachedModule = module;
+            },
             frameStarted: (module) => {
-                if (module && typeof module.pauseMainLoop === "function") unityModule = module;
+                if (canPause(module)) unityModule = module;
+                else if (attachedModule) unityModule = attachedModule;
             },
             hold: () => {
                 if (isHolding || !unityModule) return;
