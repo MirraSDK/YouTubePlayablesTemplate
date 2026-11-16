@@ -344,6 +344,10 @@ const unityApp = {
         function recalculateAspectRatio(aspectRatio) {
             const containerWidth = container.clientWidth;
             const containerHeight = container.clientHeight;
+
+            // YouTube first loads the game in a view of zero size: the canvas keeps filling it until a real size arrives.
+            if (!(containerWidth > 0 && containerHeight > 0 && aspectRatio > 0)) return;
+
             if (containerWidth / containerHeight > aspectRatio) {
                 canvas.style.width = Math.floor(containerHeight * aspectRatio) + "px";
                 canvas.style.height = "100%";
