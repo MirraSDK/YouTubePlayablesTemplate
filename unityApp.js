@@ -49,8 +49,8 @@ const unityApp = {
         }
     },
 
-    // Downloads the zipped build files with combined progress and unzips each into a blob URL.
-    downloadArchives: async function (archives, onProgress) {
+    // Downloads the zipped build files with combined progress and unzips each one into a blob URL as soon as it arrives.
+    downloadArchives: function (archives, onProgress) {
         const loaded = archives.map(() => 0);
         const sizes = archives.map(() => 0);
         const report = () => {
@@ -58,19 +58,33 @@ const unityApp = {
             onProgress(total > 0 ? loaded.reduce((sum, size) => sum + size, 0) / total : 0);
         };
 
-        const buffers = await Promise.all(archives.map((archive, index) =>
-            this.fetchWithProgress(archive.url, (done, size) => {
+        return Promise.all(archives.map((archive, index) =>
+            this.downloadArchive(archive, (done, size) => {
                 loaded[index] = done;
                 sizes[index] = size;
                 report();
             })));
-
-        return Promise.all(archives.map((archive, index) =>
-            this.unzipToBlobUrl(buffers[index], archive.name, archive.type)));
     },
 
-    fetchWithProgress: async function (url, onProgress) {
-        const response = await fetch(url);
+    // A dropped connection or a damaged response is tried again before the player is told that the game failed.
+    downloadArchive: async function (archive, onProgress) {
+        const attempts = 3;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const bytes = await this.fetchWithProgress(archive.url, onProgress, attempt > 1);
+                return await this.unzipToBlobUrl(bytes, archive.name, archive.type);
+            }
+            catch (error) {
+                if (attempt >= attempts) throw error;
+                console.warn(`Attempt ${attempt} of ${attempts} failed for ${archive.url}:`, error);
+                await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+            }
+        }
+    },
+
+    // A retry skips the browser cache, which may hold the damaged response.
+    fetchWithProgress: async function (url, onProgress, isRetry) {
+        const response = await fetch(url, isRetry ? { cache: "reload" } : undefined);
         if (!response.ok) throw new Error(`Download failed ${url}: ${response.status} ${response.statusText}`);
 
         const declaredSize = Number(response.headers.get("Content-Length")) || 0;
