@@ -1,17 +1,19 @@
 <!DOCTYPE html>
 <html lang="en-us">
 <head>
+    <!-- Content encoding: the browser must know it before it reads any script. -->
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=yes" />
+
     <!-- YouTube requires its SDK to load before any game code, then the page follows its pause and audio state. -->
+    <!-- It is the only file from another domain: YouTube Playables blocks every other outside request. -->
     <script src="https://www.youtube.com/game_api/v1"></script>
     <script src="playablesLifecycle.js"></script>
     #if !DEVELOPMENT_PLAYER
     <!-- Release builds keep the console to warnings and errors; every message costs memory and time in the browser. -->
     <script>console.log = console.info = console.debug = function () {};</script>
     #endif
-    <!-- Content encoding -->
-    <meta charset="utf-8" />
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=yes" />
 
     <!-- Page info and stylesheets -->
     <title>{{{ PRODUCT_NAME }}}</title>
