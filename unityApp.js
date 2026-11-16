@@ -120,24 +120,33 @@ const unityApp = {
     unzipToBlobUrl: async function (bytes, fileName, mimeType) {
         const entry = this.findZipEntry(bytes, fileName);
         const data = bytes.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
-        let blob;
+        if (data.length !== entry.compressedSize) throw new Error("Truncated zip archive: " + fileName);
 
-        if (entry.method === 0) {
-            blob = new Blob([data], { type: mimeType });
+        if (entry.method === 0) return URL.createObjectURL(new Blob([data], { type: mimeType }));
+        if (entry.method !== 8) throw new Error(`Unsupported zip compression method ${entry.method}: ${fileName}`);
+
+        // The engine must never get a partly inflated file, so the size is checked and the bundled decoder takes over
+        // when the native one fails.
+        let blob = null;
+        if (this.supportsRawDeflateStream()) {
+            try {
+                const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+                blob = await new Response(stream).blob();
+                if (blob.size !== entry.uncompressedSize) blob = null;
+            }
+            catch (error) {
+                console.warn(error);
+                blob = null;
+            }
         }
-        else if (entry.method !== 8) {
-            throw new Error(`Unsupported zip compression method ${entry.method}: ${fileName}`);
-        }
-        else if (this.supportsRawDeflateStream()) {
-            const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-            blob = new Blob([await new Response(stream).blob()], { type: mimeType });
-        }
-        else {
+        if (!blob) {
             if (typeof window.rawInflate !== "function") await this.loadScript("TemplateData/rawInflate.js");
-            blob = new Blob([window.rawInflate(data, entry.uncompressedSize)], { type: mimeType });
+            const inflated = window.rawInflate(data, entry.uncompressedSize);
+            if (inflated.length !== entry.uncompressedSize) throw new Error("Damaged zip entry: " + fileName);
+            blob = new Blob([inflated]);
         }
 
-        return URL.createObjectURL(blob);
+        return URL.createObjectURL(blob.slice(0, blob.size, mimeType));
     },
 
     // Chrome 80 to 102 has DecompressionStream but throws on the "deflate-raw" format.
@@ -170,12 +179,13 @@ const unityApp = {
         let fallback = null;
 
         for (let index = 0; index < count; index++) {
-            if (view.getUint32(offset, true) !== 0x02014b50) break;
+            if (offset + 46 > bytes.length || view.getUint32(offset, true) !== 0x02014b50) break;
             const nameLength = view.getUint16(offset + 28, true);
             const extraLength = view.getUint16(offset + 30, true);
             const commentLength = view.getUint16(offset + 32, true);
             const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
             const localOffset = view.getUint32(offset + 42, true);
+            if (localOffset + 30 > bytes.length) throw new Error("Truncated zip archive: " + fileName);
             const entry = {
                 method: view.getUint16(offset + 10, true),
                 compressedSize: view.getUint32(offset + 20, true),
