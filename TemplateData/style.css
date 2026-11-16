@@ -105,6 +105,17 @@ img {
     background-color: white;
 }
 
+/* Takes the place of the bar when the game cannot load. */
+#unity-load-error {
+    display: none;
+    max-width: 80%;
+    margin-top: 24px;
+    color: white;
+    font: 600 16px/1.4 sans-serif;
+    text-align: center;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
 /* ADAPTATION FOR TOO SMALL DISPLAYS */
 @media (max-width: 500px), (max-height: 500px) {
 

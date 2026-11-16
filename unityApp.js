@@ -33,6 +33,29 @@ const unityApp = {
         };
     },
 
+    // Tells YouTube that the game hit an error. The call is best effort and rate limited on its side.
+    logErrorToYouTube: function () {
+        const health = window.ytgame && window.ytgame.health;
+        try {
+            if (health && typeof health.logError === "function") health.logError();
+        }
+        catch (error) {
+            console.error(error);
+        }
+    },
+
+    // A failed load is shown on the page, because an embedded frame cannot open alert(), and is reported to YouTube.
+    reportFailure: function (error) {
+        console.error(error);
+        try {
+            if (window.pageLoader && typeof window.pageLoader.fail === "function") window.pageLoader.fail();
+        }
+        catch (failError) {
+            console.error(failError);
+        }
+        this.logErrorToYouTube();
+    },
+
     // The page loader is already on screen, so YouTube may show the game; gameReady follows once the game is playable.
     // The SDK skips its own firstFrameReady call when this flag is set.
     notifyFirstFrameReady: function () {
@@ -205,7 +228,7 @@ const unityApp = {
         return new Promise((resolve, reject) => {
             const script = document.createElement("script");
             script.src = url;
-            script.onload = resolve;
+            script.onload = () => resolve();
             script.onerror = () => reject(new Error("Failed to load " + url));
             document.head.appendChild(script);
         });
@@ -216,10 +239,12 @@ const unityApp = {
     createPageLoader: function () {
         const element = document.querySelector("#unity-loading-bar");
         const fill = document.querySelector("#unity-progress-bar-full");
+        const failure = document.querySelector("#unity-load-error");
         const weights = { download: 0.6, engine: 0.1, content: 0.3 };
         const progress = { download: 0, engine: 0, content: 0 };
         let shown = 0;
         let isHidden = false;
+        let isFailed = false;
 
         const render = () => {
             const value = weights.download * progress.download + weights.engine * progress.engine + weights.content * progress.content;
@@ -239,8 +264,15 @@ const unityApp = {
             setContentProgress: function (value) {
                 this.setStage("content", value);
             },
+            // Nothing playable is behind a failed load, so the loader stays up with a message in place of the bar.
+            fail: function () {
+                isFailed = true;
+                element.style.display = "flex";
+                fill.parentElement.style.display = "none";
+                if (failure) failure.style.display = "block";
+            },
             hide: function () {
-                if (isHidden) return;
+                if (isHidden || isFailed) return;
                 isHidden = true;
                 element.style.display = "none";
 
@@ -423,18 +455,10 @@ const unityApp = {
 
         const buildUrl = "Build";
 
-        let dataBlobUrl, codeBlobUrl;
-        try {
-            [dataBlobUrl, codeBlobUrl] = await this.downloadArchives([
-                { url: buildUrl + "/{{{ DATA_FILENAME }}}.zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
-                { url: buildUrl + "/{{{ CODE_FILENAME }}}.zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
-            ], (progress) => pageLoader.setStage("download", progress));
-        }
-        catch (error) {
-            console.error(error);
-            alert("The game failed to download. Please check your connection and reload.");
-            return;
-        }
+        const [dataBlobUrl, codeBlobUrl] = await this.downloadArchives([
+            { url: buildUrl + "/{{{ DATA_FILENAME }}}.zip", name: "{{{ DATA_FILENAME }}}", type: "application/octet-stream" },
+            { url: buildUrl + "/{{{ CODE_FILENAME }}}.zip", name: "{{{ CODE_FILENAME }}}", type: "application/wasm" },
+        ], (progress) => pageLoader.setStage("download", progress));
 
         const loaderUrl = buildUrl + "/{{{ LOADER_FILENAME }}}";
         const config = {
@@ -504,32 +528,28 @@ const unityApp = {
             config.devicePixelRatio = this.toNumber(devicePixelRatio);
         }
 
-        const script = document.createElement("script");
-        script.src = loaderUrl;
-        script.onload = () => {
-            createUnityInstance(canvas, config, (progress) => {
-                pageLoader.setStage("engine", progress);
-            }).then((unityInstance) => {
-                pageLoader.setStage("engine", 1);
-                if (lifecycle) lifecycle.attachUnity(unityInstance);
+        await this.loadScript(loaderUrl);
+        if (typeof createUnityInstance !== "function") {
+            throw new Error("The Unity loader did not define createUnityInstance: " + loaderUrl);
+        }
 
-                // The game hides the loader when its first scene is playable; this only keeps a broken boot from hiding behind it.
-                setTimeout(() => pageLoader.hide(), 180000);
+        const unityInstance = await createUnityInstance(canvas, config, (progress) => {
+            pageLoader.setStage("engine", progress);
+        });
+        pageLoader.setStage("engine", 1);
+        if (lifecycle) lifecycle.attachUnity(unityInstance);
 
-                #if SHOW_DIAGNOSTICS
-                // Position the diagnostics icon in the corner on the canvas.
-                const diagnostics_icon = document.getElementById("diagnostics-icon");
-                diagnostics_icon.onclick = () => {
-                    unityDiagnostics.openDiagnosticsDiv(unityInstance.GetMetricsInfo);
-                };
-                canvas.after(diagnostics_icon);
-                #endif
-            }).catch((message) => {
-                pageLoader.hide();
-                alert(message);
-            });
+        // The game hides the loader when its first scene is playable; this only keeps a broken boot from hiding behind it.
+        setTimeout(() => pageLoader.hide(), 180000);
+
+        #if SHOW_DIAGNOSTICS
+        // Position the diagnostics icon in the corner on the canvas.
+        const diagnostics_icon = document.getElementById("diagnostics-icon");
+        diagnostics_icon.onclick = () => {
+            unityDiagnostics.openDiagnosticsDiv(unityInstance.GetMetricsInfo);
         };
-        document.body.appendChild(script);
+        canvas.after(diagnostics_icon);
+        #endif
     },
 
     isMobile: function () {
@@ -596,5 +616,5 @@ for (const step of ["applyScriptNonce", "applyCommonFixes", "tryRotationLock", "
     }
 }
 
-// Automatically start after script is loaded.
-unityApp.startLoading();
+// Automatically start after script is loaded. Every failure on the way ends on the page, not in an unhandled rejection.
+unityApp.startLoading().catch((error) => unityApp.reportFailure(error));
