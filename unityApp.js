@@ -600,6 +600,8 @@ const unityApp = {
             pageLoader.setStage("engine", progress);
         });
         pageLoader.setStage("engine", 1);
+        // Games with UnityYTGameSDKLib.jslib send their load data, pause, audio and ad callbacks to this instance.
+        window.unityGameInstance = unityInstance;
         if (lifecycle) lifecycle.attachUnity(unityInstance);
 
         // The game hides the loader when its first scene is playable; this only keeps a broken boot from hiding behind it.
